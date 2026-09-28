@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt, field_validator, model_validator
 
 
 class Node(BaseModel):
@@ -278,6 +278,103 @@ class FailureIsolationResponse(BaseModel):
     )
     total_cost: NonNegativeInt = Field(
         ..., description="Sum of the isolation costs over `isolated`."
+    )
+
+
+# --------------------------------------------------------- failure probes
+
+
+class ProbeObservation(BaseModel):
+    """A probe already performed, with its observed outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node: str = Field(..., min_length=1, description="Probed graph node name.")
+    result: Literal["pass", "fail"] = Field(
+        ..., description="Observed probe outcome: pass or fail."
+    )
+
+
+class FailureProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[Node] = Field(
+        ..., description="Build graph nodes (same schema as /plans)."
+    )
+    target: str = Field(
+        ..., min_length=1, description="Node known to have failed its build."
+    )
+    observations: list[ProbeObservation] = Field(
+        default_factory=list,
+        description=(
+            "Optional probes already completed, each with the probed node "
+            "name and its pass/fail outcome."
+        ),
+    )
+
+
+class ProbeTreeNode(BaseModel):
+    """One node of the adaptive probe tree.
+
+    An internal node names the node to probe next and carries the tree to
+    follow for each outcome; a leaf names the unique faulty node.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    probe: Optional[str] = Field(
+        default=None,
+        description="Node to probe next (internal nodes only).",
+    )
+    passed: Optional["ProbeTreeNode"] = Field(
+        default=None,
+        alias="pass",
+        description="Subtree to follow when the probe passes.",
+    )
+    failed: Optional["ProbeTreeNode"] = Field(
+        default=None,
+        alias="fail",
+        description="Subtree to follow when the probe fails.",
+    )
+    fault: Optional[str] = Field(
+        default=None,
+        description="Unique faulty node (leaf nodes only).",
+    )
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "ProbeTreeNode":
+        is_leaf = self.fault is not None
+        is_internal = self.probe is not None
+        if is_leaf == is_internal:
+            raise ValueError(
+                "a probe tree node must be either a leaf (fault only) or an "
+                "internal node (probe with pass and fail branches)"
+            )
+        if is_internal and (self.passed is None or self.failed is None):
+            raise ValueError(
+                "an internal probe tree node needs both pass and fail branches"
+            )
+        return self
+
+
+ProbeTreeNode.model_rebuild()
+
+
+class FailureProbeResponse(BaseModel):
+    worst_case: NonNegativeInt = Field(
+        ...,
+        description=(
+            "Minimum possible worst-case number of additional probes needed "
+            "to identify the unique faulty node."
+        ),
+    )
+    tree: ProbeTreeNode = Field(
+        ...,
+        description=(
+            "Optimal adaptive probe tree rooted at the current candidate set; "
+            "internal nodes give the probe and pass/fail branches, leaves "
+            "give the faulty node."
+        ),
     )
 
 

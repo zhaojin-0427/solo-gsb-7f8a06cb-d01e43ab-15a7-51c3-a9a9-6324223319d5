@@ -49,17 +49,26 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 签名，任一不符即返回 `trusted=false` 与按节点名排序的原因（详见下文对应
 章节）。
 
+`POST /failure-probes` 面向**单故障构建的探测规划**：沿用 `/plans` 的节点图，
+给出已知构建失败的目标节点及可选的已完成探测（节点名与通过/失败结果）；
+服务先按观测把目标依赖闭包（最多 10 个节点，假定其中恰有一个故障节点）中
+的候选故障节点缩小，再精确生成一棵最坏情况下**新增探测次数最少**的自适应
+探测树——探测某节点当且仅当故障位于该节点或其传递依赖中时失败，内部节点
+给出探测名与通过、失败分支，叶子给出唯一故障节点；候选只剩一个时零次探测
+（详见下文对应章节）。
+
 ## 目录结构
 
 ```
 app/
-  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、/provenance/verify、GET /health
+  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/failure-probes、/release-bundles、/release-transitions、/release-policies、/provenance/verify、GET /health
   models.py     # 请求/响应 Pydantic 模型
   planner.py    # 图校验、指纹、拓扑排序、缓存判定与批次划分（纯函数核心）
   impacts.py    # 两图对比、根因识别与最短传导路径分析（纯函数核心）
   retention.py  # 容量受限的缓存保留选择（纯函数核心）
   audit.py      # 执行事件流回放与违规核查（纯函数核心）
   isolation.py  # 发布前失败隔离节点的最小成本选择（纯函数核心）
+  probes.py     # 单故障构建的自适应探测树精确规划（纯函数核心）
   bundles.py    # 依赖一致的发布制品包精确选择（纯函数核心）
   transitions.py# 发布包之间最少步骤的逐节点制品切换规划（纯函数核心）
   policies.py   # 组织条款标签的发布判定（纯函数核心）
@@ -70,6 +79,7 @@ tests/
   test_retention.py
   test_audit.py
   test_isolation.py
+  test_probes.py
   test_bundles.py
   test_transitions.py
   test_policies.py
@@ -108,6 +118,10 @@ uvicorn app.main:app --reload --port 8000
 
 ```bash
 curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":[{"name":"core","content_digest":"c","dependency_names":[]},{"name":"util","content_digest":"u","dependency_names":["core"]},{"name":"api","content_digest":"a","dependency_names":["util"]}],"target":"api","observations":[{"node":"core","result":"pass"}]}'
+# {"worst_case":1,"tree":{"probe":"util","pass":{"fault":"api"},"fail":{"fault":"util"}}}
 curl -s -X POST http://localhost:8000/release-transitions \
   -H 'Content-Type: application/json' \
   -d '{"nodes":[{"name":"a","content_digest":"a","dependency_names":[]}],"target":"a","artifacts":[{"id":"a1","node":"a","fingerprint":"f1","size":1,"dependencies":{}},{"id":"a2","node":"a","fingerprint":"f2","size":1,"dependencies":{}}],"current_ids":["a1"],"next_ids":["a2"]}'
@@ -647,6 +661,177 @@ curl -s -X POST http://localhost:8000/failure-isolation \
 `duplicate_node`、`missing_dependency`、`cycle_detected` 校验与 `/plans`
 一致；失败/目标列表为空、成本为负、未知字段等由 Pydantic 拒绝
 （HTTP `422`）。
+
+## POST /failure-probes：单故障构建的探测规划
+
+构建失败后，`POST /failure-probes` 为定位**唯一故障节点**规划一棵自适应探测
+树。请求包含：
+
+- `nodes`：节点图（字段与 `/plans` 完全相同）；
+- `target`：**已知构建失败**的目标节点名（必须在图中）；
+- `observations`（可选，缺省为空）：已经完成的探测列表，每项含 `node`
+  （探测的节点名）与 `result`（`pass` / `fail`）。
+
+故障模型：目标的**依赖闭包**（目标自身及其全部传递依赖）中**恰有一个**
+故障节点，闭包最多 **10** 个节点。探测语义为：
+
+- 探测节点 `n` **失败** 当且仅当故障位于 `n` 自身或 `n` 的任一传递依赖中，
+  即故障在 `n` 的依赖闭包内；否则探测**通过**；
+- 目标自身构建失败等价于对目标的一次失败探测，因此目标始终是候选之一。
+
+规划规则：
+
+- 先用观测缩小候选集：失败探测把候选限制在该节点闭包内，通过探测把该
+  闭包从候选中剔除；
+- 然后对候选子集做**精确极小化极大（minimax）动态规划**，生成最坏情况下
+  **新增探测次数最少**的自适应探测树；同样最优时，**每个分支状态独立地**
+  选名字字典序最小的探测节点（相同切分效果的多个节点视为等价，取最小名）；
+- 探测节点可以是图中**任意节点**：闭包之外的节点若依赖若干闭包节点，其
+  探测能产生“闭包内任一节点探测都给不出”的切分，从而可能进一步降低最坏
+  次数（见下文示例）；与闭包完全不相交的节点永远探测通过，不可能最优；
+- 候选只剩一个节点时，`worst_case` 为 `0`，树直接是该故障节点的叶子。
+
+响应字段：`worst_case`（最少的最坏情况新增探测次数，非负整数）、`tree`
+（自适应探测树）。树节点二选一：
+
+- 内部节点：`probe`（下一步探测的节点名）、`pass`（探测通过时的子树）、
+  `fail`（探测失败时的子树）；
+- 叶子节点：`fault`（唯一故障节点名）。
+
+错误（均为 HTTP `400`）：
+
+- 图本身的 `duplicate_node`、`missing_dependency`、`cycle_detected` 校验与
+  `/plans` 一致；
+- `unknown_target`：目标不在图中；
+- `unknown_probe_node`：观测引用了图中不存在的节点；
+- `duplicate_observation`：同一节点出现多条观测（无论结果是否相同）；
+- `contradictory_observations`：所有观测与“闭包内恰有一个故障节点”矛盾，
+  候选集被缩为空（例如对失败目标给一条通过观测、两条通过/失败观测互不
+  相容等）；
+- `closure_too_large`：目标依赖闭包超过 10 个节点。
+
+`result` 取值非 `pass` / `fail`、节点名为空、未知字段等由 Pydantic 拒绝
+（HTTP `422`）。观测与节点的书写顺序不影响结果。
+
+### 调用示例
+
+链式闭包 `core → util → api`（`api` 依赖 `util`，`util` 依赖 `core`），目标
+为构建失败的 `api`，无已完成探测：
+
+```bash
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "core", "content_digest": "c", "dependency_names": []},
+      {"name": "util", "content_digest": "u", "dependency_names": ["core"]},
+      {"name": "api",  "content_digest": "a", "dependency_names": ["util"]}
+    ],
+    "target": "api"
+  }'
+```
+
+响应（`200 OK`）：
+
+```json
+{
+  "worst_case": 2,
+  "tree": {
+    "probe": "core",
+    "pass": {
+      "probe": "util",
+      "pass": {"fault": "api"},
+      "fail": {"fault": "util"}
+    },
+    "fail": {"fault": "core"}
+  }
+}
+```
+
+解读：先探测 `core`；失败即定位 `core`；通过则再探测 `util`，失败为
+`util`、通过为 `api`，最坏 2 次新增探测。
+
+带上已完成探测（`core` 已探测通过）后，候选只剩 `{util, api}`，最坏 1 次：
+
+```bash
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "core", "content_digest": "c", "dependency_names": []},
+      {"name": "util", "content_digest": "u", "dependency_names": ["core"]},
+      {"name": "api",  "content_digest": "a", "dependency_names": ["util"]}
+    ],
+    "target": "api",
+    "observations": [{"node": "core", "result": "pass"}]
+  }'
+```
+
+```json
+{
+  "worst_case": 1,
+  "tree": {
+    "probe": "util",
+    "pass": {"fault": "api"},
+    "fail": {"fault": "util"}
+  }
+}
+```
+
+观测已唯一确定故障节点时零次探测（如 `core` 探测失败）：
+
+```json
+{"worst_case": 0, "tree": {"fault": "core"}}
+```
+
+闭包之外的探测节点可能更优：下图目标闭包为 `{l0, l1, m, t}`（`m` 同时依赖
+`l0`、`l1`，`t` 依赖 `m`），闭包内任一节点探测都只能切出前缀；而闭包外
+节点 `x` 同时依赖 `l0`、`l1`，探测 `x` 先把候选切成 `{l0,l1}` 与 `{m,t}`
+两个大小相同的集合，最坏次数从 3 降到 2：
+
+```bash
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "l0", "content_digest": "0", "dependency_names": []},
+      {"name": "l1", "content_digest": "1", "dependency_names": []},
+      {"name": "m",  "content_digest": "m", "dependency_names": ["l0", "l1"]},
+      {"name": "t",  "content_digest": "t", "dependency_names": ["m"]},
+      {"name": "x",  "content_digest": "x", "dependency_names": ["l0", "l1"]}
+    ],
+    "target": "t"
+  }'
+```
+
+```json
+{
+  "worst_case": 2,
+  "tree": {
+    "probe": "x",
+    "pass": {
+      "probe": "m",
+      "pass": {"fault": "t"},
+      "fail": {"fault": "m"}
+    },
+    "fail": {
+      "probe": "l0",
+      "pass": {"fault": "l1"},
+      "fail": {"fault": "l0"}
+    }
+  }
+}
+```
+
+观测矛盾示例（对失败目标 `api` 又给一条 `api` 探测通过的观测，HTTP `400`）：
+
+```json
+{
+  "code": "contradictory_observations",
+  "message": "No single faulty node in the target closure is consistent with all observations",
+  "details": {"target": "api"}
+}
+```
 
 ## POST /release-bundles：依赖一致的发布制品包
 
@@ -1237,6 +1422,7 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | POST   | `/cache-retention`   | 容量限制下挑选保留制品，最小化目标重建代价 |
 | POST   | `/execution-audits`  | 按 seq 回放执行事件流，核查合法性并给出终态 |
 | POST   | `/failure-isolation` | 挑选最小成本隔离节点，阻断失败源到发布目标 |
+| POST   | `/failure-probes`    | 用最少最坏次数的自适应探测树定位唯一故障节点 |
 | POST   | `/release-bundles`    | 选择总大小最小的依赖一致发布制品包         |
 | POST   | `/release-transitions`| 规划两包间最少步骤的逐节点制品切换         |
 | POST   | `/release-policies`   | 沿 bundled 边闭包判定组织条款能否发布      |
@@ -1290,6 +1476,21 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | `failed_nodes`    | string[]（非空，唯一）| 失败构建节点名，必须在图中               |
 | `targets`         | string[]（非空，唯一）| 发布目标节点名，必须在图中且不与失败重叠 |
 | `isolation_costs` | object<string,int≥0>  | 可隔离节点名 → 隔离成本（最多 16 个）    |
+
+`/failure-probes` 请求体字段：
+
+| 字段                     | 类型                  | 说明                                     |
+|--------------------------|-----------------------|------------------------------------------|
+| `nodes`                  | Node[]                | 节点图（字段同 `/plans`）                |
+| `target`                 | string（非空）        | 已知构建失败的目标节点，必须在图中        |
+| `observations`           | ProbeObservation[]    | 已完成探测，可为空表，节点名不可重复      |
+| `observations[].node`    | string（非空）        | 被探测节点名，必须在图中                  |
+| `observations[].result`  | string                | `pass` / `fail`                          |
+
+响应字段：`worst_case`（最少的最坏情况新增探测次数；候选唯一时为 0）、
+`tree`（探测树；内部节点含 `probe` 与 `pass` / `fail` 两个子树，叶子节点含
+`fault`）。目标依赖闭包超过 10 个节点、未知目标或探测节点、重复或矛盾观测
+返回 HTTP `400`（错误码见上文对应章节）。
 
 `/release-bundles` 请求体字段：
 
@@ -1371,12 +1572,16 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试共 334 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
+测试共 370 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
 缺失依赖、环（含自环）、重名、顺序无关性、两图对比的根因识别、最短传导
 路径与字典序取舍、双图分别校验、缓存保留的最优选择与字典序平局取舍、
 候选上限与各类引用错误、执行事件回放的合法性与违规忽略、失败节点的
 blocked 传递、重复 seq 与未知节点错误、失败隔离的最小成本选择、字典序
-平局取舍、空路径空集合、不可阻断与各类校验错误、发布制品包的最小总大小
+平局取舍、空路径空集合、不可阻断与各类校验错误、单故障探测树的极小化
+极大最优性、链式/菱形/星形闭包的最坏次数、闭包外探测节点产生更优切分、
+字典序平局、观测缩小候选与零探测叶子、重复/矛盾观测、未知目标与探测
+节点、闭包上限及随机图上的独立极小化极大对照与全候选树遍历、发布制品包
+的最小总大小
 选择与 id 列表字典序平局、共享依赖只计一次、闭包外制品排除、过期指纹与
 依赖不一致导致的无解、发布包切换的最少步骤与 `(node, id)` 序列字典序
 平局取舍、过渡制品与节点多次切换（回退）、中间包依赖一致、两包相同与

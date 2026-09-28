@@ -16,6 +16,8 @@ from app.models import (
     ExecutionAuditResponse,
     FailureIsolationRequest,
     FailureIsolationResponse,
+    FailureProbeRequest,
+    FailureProbeResponse,
     ImpactRequest,
     ImpactResponse,
     PlanRequest,
@@ -31,13 +33,14 @@ from app.models import (
 )
 from app.planner import PlanError, build_plan
 from app.policies import evaluate_release_policy
+from app.probes import plan_failure_probes
 from app.provenance import verify_provenance
 from app.retention import plan_cache_retention
 from app.transitions import plan_release_transitions
 
 app = FastAPI(
     title="Incremental Build Planner",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "Computes content-addressable fingerprints over a dependency graph "
         "and schedules cache-missing nodes into parallel build batches. "
@@ -52,7 +55,9 @@ app = FastAPI(
         "switches that turn one release bundle into another, evaluates "
         "organization clause tags over the bundled dependency closure to "
         "decide whether a target may be released, and verifies Ed25519 "
-        "signed build-result provenance chains over a target closure."
+        "signed build-result provenance chains over a target closure, and "
+        "plans an optimal adaptive probe tree that locates the unique "
+        "faulty node in a failed target's dependency closure."
     ),
 )
 
@@ -111,6 +116,19 @@ async def create_failure_isolation(
         request.failed_nodes,
         request.targets,
         request.isolation_costs,
+    )
+
+
+@app.post("/failure-probes", response_model=FailureProbeResponse)
+async def create_failure_probe(
+    request: FailureProbeRequest,
+) -> JSONResponse:
+    response = plan_failure_probes(
+        request.nodes, request.target, request.observations
+    )
+    # Leaves carry only `fault`; internal nodes carry only probe/pass/fail.
+    return JSONResponse(
+        content=response.model_dump(by_alias=True, exclude_none=True)
     )
 
 
