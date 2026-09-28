@@ -49,11 +49,17 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 签名，任一不符即返回 `trusted=false` 与按节点名排序的原因（详见下文对应
 章节）。
 
+`POST /failure-probes` 面向**单故障构建探测规划**：提交 `/plans` 同构的
+节点图、一个已知构建失败的目标节点，以及可选的已完成探测（节点名 + 通过/
+失败）；服务先据观测缩小故障候选集，再给出一棵在最坏情况下**新增探测次数
+最少**的自适应探测树（内部节点给探测名与通过/失败分支，叶子给唯一故障
+节点），同优分支按探测节点名字典序取最小（详见下文对应章节）。
+
 ## 目录结构
 
 ```
 app/
-  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、/provenance/verify、GET /health
+  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、/provenance/verify、/failure-probes、GET /health
   models.py     # 请求/响应 Pydantic 模型
   planner.py    # 图校验、指纹、拓扑排序、缓存判定与批次划分（纯函数核心）
   impacts.py    # 两图对比、根因识别与最短传导路径分析（纯函数核心）
@@ -64,6 +70,7 @@ app/
   transitions.py# 发布包之间最少步骤的逐节点制品切换规划（纯函数核心）
   policies.py   # 组织条款标签的发布判定（纯函数核心）
   provenance.py # Ed25519 签名构建结果证明链的核验（纯函数核心）
+  probes.py     # 单故障定位的最少最坏次数自适应探测树规划（纯函数核心）
 tests/
   test_planner.py
   test_impacts.py
@@ -74,6 +81,7 @@ tests/
   test_transitions.py
   test_policies.py
   test_provenance.py
+  test_probes.py
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -112,6 +120,28 @@ curl -s -X POST http://localhost:8000/release-transitions \
   -H 'Content-Type: application/json' \
   -d '{"nodes":[{"name":"a","content_digest":"a","dependency_names":[]}],"target":"a","artifacts":[{"id":"a1","node":"a","fingerprint":"f1","size":1,"dependencies":{}},{"id":"a2","node":"a","fingerprint":"f2","size":1,"dependencies":{}}],"current_ids":["a1"],"next_ids":["a2"]}'
 # {"possible":true,"steps":[{"node":"a","id":"a2","bundle":{"a":"a2"}}]}
+```
+
+宿主机的 8000 端口被占用时，可把服务发布到 **8000** 端口后调用——容器内仍
+监听 8000，镜像无需任何改动：
+
+```bash
+# 方式一：docker run 直接改发布端口（镜像名见 docker compose 构建结果）
+docker compose build
+docker run --rm -p 8000:8000 incremental-build-planner:latest
+
+# 方式二：不使用 Docker 时让 uvicorn 直接监听 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+另开一个终端向 8000 端口调用新接口：
+
+```bash
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":[{"name":"a","content_digest":"a","dependency_names":[]},{"name":"b","content_digest":"b","dependency_names":["a"]}],"target":"b"}'
+# {"worst_case":1,"tree":{"probe":"a","passed":{"fault":"b"},"failed":{"fault":"a"}}}
 ```
 
 ## 请求示例
@@ -1192,6 +1222,191 @@ curl -s -X POST http://localhost:8000/provenance/verify \
 }
 ```
 
+## POST /failure-probes：单故障构建探测规划
+
+构建失败后，`POST /failure-probes` 在**目标依赖闭包内恰有一个故障节点**的
+假设下，规划一棵自适应探测树以精确定位故障节点。请求包含：
+
+- `nodes`：节点图（字段与 `/plans` 完全相同）；
+- `target`：**已知构建失败**的目标节点名（必须在图中）；
+- `observations`（可缺省，缺省为空表）：**已完成探测**列表，每项含
+  `node`（被探测节点名，必须在图中）与 `result`（`passed` 或 `failed`）。
+
+故障与探测模型：
+
+- 目标自身与其全部传递依赖构成**依赖闭包**，闭包**最多 10 个节点**
+  （`closure_too_large`），并假定其中**恰有一个故障节点**；
+- 探测节点 `n` **当且仅当故障位于 `n` 自身或其传递依赖中时失败**
+  （`probe(n) failed ⇔ fault ∈ closure(n)`）。因此探测目标本身恒失败、
+  不能区分任何候选，规划器永远不会选择它；
+- 探测对象不限于闭包：图中**任意节点**都可探测——依赖于部分闭包节点的
+  闭包外节点能提供额外的切分信息（见下文平衡切分示例），而与闭包互不
+  可达的节点的探测结果恒为通过、不会被选中（对其观测为失败则与单故障
+  假设矛盾）。
+
+候选集缩小（先据观测过滤）：
+
+- 观测 `(n, passed)`：从候选中删除 `n` 及其全部传递依赖；
+- 观测 `(n, failed)`：候选只保留 `n` 及其传递依赖与当前候选的交集；
+- 同一节点出现多次即 `duplicate_observation`（无论结果是否一致）；
+  联合起来排除了闭包中所有节点的观测即 `contradictory_observation`；
+- 候选只剩**一个**节点时返回 `worst_case=0`，树直接是给出该节点的叶子。
+
+自适应探测树（精确优化）：
+
+- 对候选子集做极小化极大动态规划：在每个状态选探测节点，使
+  `1 + max(通过分支最坏次数, 失败分支最坏次数)` **最小**，即最坏情况下的
+  **新增探测次数最少**（已完成探测不计入）；只考虑能把当前候选切成两个
+  非空部分的探测；
+- 最坏次数相同时，在每个状态独立选择**名字典序最小**的探测节点；由最优
+  子结构，这等价于整棵树按字典序取最小；
+- 响应 `tree` 是递归结构：**内部节点**为 `{"probe": 探测名, "passed":
+  通过分支, "failed": 失败分支}`，**叶子**为 `{"fault": 故障节点名}`；
+  `worst_case` 即树高；
+- 请求中节点与观测的书写顺序均不影响结果。
+
+错误（均为 HTTP `400`）：
+
+- 图本身的 `duplicate_node`、`missing_dependency`、`cycle_detected` 校验与
+  `/plans` 一致；
+- `unknown_target`：目标不在图中；
+- `closure_too_large`：目标依赖闭包超过 10 个节点（`details` 含 `nodes`
+  与 `limit`）；
+- `unknown_probe_node`：已完成探测引用了图中不存在的节点；
+- `duplicate_observation`：同一节点被观测多次（`details.nodes` 按名排序）；
+- `contradictory_observation`：观测联合排除了闭包内全部节点，与“恰有一个
+  故障节点”矛盾。
+
+`observations` 缺省或为空表合法；`result` 取值非 `passed` / `failed`、
+节点名为空字符串、未知字段等由 Pydantic 拒绝（HTTP `422`）。
+
+### 调用示例
+
+下图：`web` 依赖 `api`，`api` 依赖 `util` 与 `core`，即菱形
+`core → util,api → web`（这里用短名：`a=core, b=util, c=api, t=web`）。
+不给任何已完成探测：
+
+```bash
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "a", "content_digest": "a", "dependency_names": []},
+      {"name": "b", "content_digest": "b", "dependency_names": ["a"]},
+      {"name": "c", "content_digest": "c", "dependency_names": ["a"]},
+      {"name": "t", "content_digest": "t", "dependency_names": ["b", "c"]}
+    ],
+    "target": "t"
+  }'
+```
+
+响应（`200 OK`）：
+
+```json
+{
+  "worst_case": 2,
+  "tree": {
+    "probe": "b",
+    "passed": {
+      "probe": "c",
+      "passed": {"fault": "t"},
+      "failed": {"fault": "c"}
+    },
+    "failed": {
+      "probe": "a",
+      "passed": {"fault": "b"},
+      "failed": {"fault": "a"}
+    }
+  }
+}
+```
+
+解读：
+
+- 探测 `b`：失败则故障在 `{a, b}`，再探 `a` 区分（通过→`b`，失败→`a`）；
+  通过则故障在 `{c, t}`，再探 `c` 区分（通过→`t`，失败→`c`）；最坏只需
+  **2 次**新增探测；
+- 先探 `a` 会把最坏情况拉到 3 次（失败后仍要区分 `a, b, c` 三者），故
+  最优首选是名字最小的最优切分 `b`；
+- 叶子的故障名与真实故障一致：例如真实故障为 `a` 时，`b` 失败、`a` 失败，
+  走到叶子 `{"fault": "a"}`。
+
+带上已完成探测（`b` 已通过 → 排除 `a, b`；`c` 已失败、`a` 已通过 → 唯一
+候选 `c`），直接零次定位：
+
+```bash
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "a", "content_digest": "a", "dependency_names": []},
+      {"name": "b", "content_digest": "b", "dependency_names": ["a"]},
+      {"name": "c", "content_digest": "c", "dependency_names": ["a"]},
+      {"name": "t", "content_digest": "t", "dependency_names": ["b", "c"]}
+    ],
+    "target": "t",
+    "observations": [
+      {"node": "b", "result": "passed"},
+      {"node": "c", "result": "failed"},
+      {"node": "a", "result": "passed"}
+    ]
+  }'
+# {"worst_case":0,"tree":{"fault":"c"}}
+```
+
+**闭包外节点也可探测**。目标 `t` 有四个互不依赖的依赖 `a, b, c, d`
+（闭包 5 个节点）。只探闭包节点时每次最多单切，最坏需要 4 次；若图中还有
+依赖闭包子集的聚合节点，它们能实现更平衡的切分，最坏降到
+⌈log₂ 5⌉ = 3 次（最优探针的名字在同优时取最小）：
+
+```bash
+curl -s -X POST http://localhost:8000/failure-probes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "a", "content_digest": "a", "dependency_names": []},
+      {"name": "b", "content_digest": "b", "dependency_names": []},
+      {"name": "c", "content_digest": "c", "dependency_names": []},
+      {"name": "d", "content_digest": "d", "dependency_names": []},
+      {"name": "t", "content_digest": "t", "dependency_names": ["a", "b", "c", "d"]},
+      {"name": "ab", "content_digest": "ab", "dependency_names": ["a", "b"]},
+      {"name": "cd", "content_digest": "cd", "dependency_names": ["c", "d"]}
+    ],
+    "target": "t"
+  }'
+# {"worst_case":3,"tree":{ ... }}
+```
+
+矛盾观测示例（探测目标自身通过，与“目标已知失败”矛盾，HTTP `400`）：
+
+```json
+{
+  "code": "contradictory_observation",
+  "message": "The completed probes rule out every closure node; exactly one faulty node was assumed",
+  "details": {"target": "t"}
+}
+```
+
+其他错误示例（同一节点被观测两次，HTTP `400`）：
+
+```json
+{
+  "code": "duplicate_observation",
+  "message": "Each node may be observed at most once",
+  "details": {"nodes": ["b"]}
+}
+```
+
+闭包超限示例（10 个互不依赖的依赖加上目标共 11 个节点，HTTP `400`）：
+
+```json
+{
+  "code": "closure_too_large",
+  "message": "The target closure has 11 nodes; at most 10 are supported",
+  "details": {"nodes": 11, "limit": 10}
+}
+```
+
 ## 指纹与批次的计算规则
 
 **指纹**（按拓扑序计算）：
@@ -1241,6 +1456,7 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | POST   | `/release-transitions`| 规划两包间最少步骤的逐节点制品切换         |
 | POST   | `/release-policies`   | 沿 bundled 边闭包判定组织条款能否发布      |
 | POST   | `/provenance/verify`  | 重算闭包指纹并核验 Ed25519 签名证明链      |
+| POST   | `/failure-probes`     | 据已完成探测定位唯一故障节点，输出最坏次数最少的自适应探测树 |
 
 `/plans` 请求体字段：
 
@@ -1358,6 +1574,22 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 全通过时为 `{}`）。重复证明、闭包外证明、未知目标、无效图、畸形 Base64
 编码等返回 HTTP `400`（错误码见上文对应章节）。
 
+`/failure-probes` 请求体字段：
+
+| 字段                     | 类型            | 说明                                                |
+|--------------------------|-----------------|-----------------------------------------------------|
+| `nodes`                  | Node[]          | 节点图（字段同 `/plans`）                           |
+| `target`                 | string（非空）  | 已知构建失败的目标节点，必须在图中；其依赖闭包至多 10 个节点 |
+| `observations`           | Observation[]   | 已完成探测，可缺省/为空表；同节点不可重复，结果须一致 |
+| `observations[].node`    | string（非空）  | 被探测的节点名，必须在图中（闭包外节点也允许）       |
+| `observations[].result`  | string          | `passed` 或 `failed`                                 |
+
+响应字段：`worst_case`（定位唯一故障所需的最少最坏**新增探测**次数；候选
+唯一时为 0，即树高）、`tree`（递归探测树：内部节点含 `probe` 与
+`passed` / `failed` 两个分支；叶子含 `fault` 给出故障节点名）。未知目标、
+闭包超 10 个节点、未知探测节点、重复/矛盾观测、无效图返回 HTTP `400`
+（错误码见上文对应章节）。
+
 ## 本地开发与测试（不使用 Docker）
 
 需要 Python 3.11+：
@@ -1371,7 +1603,7 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试共 334 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
+测试共 369 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
 缺失依赖、环（含自环）、重名、顺序无关性、两图对比的根因识别、最短传导
 路径与字典序取舍、双图分别校验、缓存保留的最优选择与字典序平局取舍、
 候选上限与各类引用错误、执行事件回放的合法性与违规忽略、失败节点的
@@ -1387,4 +1619,8 @@ blocked 传递、重复 seq 与未知节点错误、失败隔离的最小成本�
 Ed25519 签名链与多签署者、指纹/依赖名/依赖摘要/签署者/签名各项不符的
 按节点排序原因、闭包缺证明与依赖摘要断链、输入顺序无关性、重复证明、
 闭包外证明与图外证明、未知目标与无效图、Base64/长度畸形的密钥与签名
-编码错误，以及全部 HTTP 状态码。
+编码错误、单故障探测的观测候选集缩小（通过/失败/闭包外观测）、极小化
+极大动态规划的最少最坏探测次数与每分支字典序探测名取舍、单候选零探测、
+链式二分高度与闭包外聚合节点的平衡切分、随机 DAG 上树与独立参考实现及
+逐故障模拟的交叉校验、矛盾/重复观测、未知目标/探测节点与闭包 10 节点
+上限等各类校验错误，以及全部 HTTP 状态码。

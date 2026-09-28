@@ -1,7 +1,7 @@
 """Pydantic models for the build plan API."""
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveInt, field_validator
 
@@ -661,5 +661,89 @@ class ProvenanceVerifyResponse(BaseModel):
             "name; empty when trusted.  Possible codes: missing_attestation, "
             "unknown_signer, fingerprint_mismatch, dependency_mismatch, "
             "dependency_digest_mismatch, invalid_signature."
+        ),
+    )
+
+
+# --------------------------------------------------------- failure probes
+
+
+class ProbeObservation(BaseModel):
+    """A probe already completed before the request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node: str = Field(
+        ..., min_length=1, description="Name of the node that was probed."
+    )
+    result: Literal["passed", "failed"] = Field(
+        ..., description="Observed outcome of the probe: passed or failed."
+    )
+
+
+class FailureProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[Node] = Field(
+        ..., description="Build graph nodes (same schema as /plans)."
+    )
+    target: str = Field(
+        ..., min_length=1, description="Known-failing build target (must be in the graph)."
+    )
+    observations: list[ProbeObservation] = Field(
+        default_factory=list,
+        description=(
+            "Already completed probes, each a node name with its passed/failed "
+            "outcome. A node may appear at most once and the observations must "
+            "be mutually consistent."
+        ),
+    )
+
+
+class ProbeLeaf(BaseModel):
+    """A decision-tree leaf: exactly one fault candidate remains."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    fault: str = Field(..., min_length=1, description="The unique faulty node.")
+
+
+class ProbeInternal(BaseModel):
+    """A decision-tree internal node: the next probe and its two branches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    probe: str = Field(
+        ..., min_length=1, description="Node to probe next."
+    )
+    passed: "ProbeNode" = Field(
+        ..., description="Sub-tree when the probe passes (fault is outside the probed node and its transitive dependencies)."
+    )
+    failed: "ProbeNode" = Field(
+        ..., description="Sub-tree when the probe fails (fault is the probed node or a transitive dependency)."
+    )
+
+
+ProbeNode = Annotated[
+    Union[ProbeInternal, ProbeLeaf],
+    Field(description="Internal probe decision or a leaf naming the faulty node."),
+]
+ProbeInternal.model_rebuild()
+
+
+class FailureProbeResponse(BaseModel):
+    worst_case: NonNegativeInt = Field(
+        ...,
+        description=(
+            "Minimum possible number of additional probes (0 when only one "
+            "candidate remains), i.e. the height of the adaptive probe tree."
+        ),
+    )
+    tree: ProbeNode = Field(
+        ...,
+        description=(
+            "Adaptive probe tree: internal nodes give the probe node with "
+            "passed/failed branches, leaves name the faulty node. A leaf is "
+            "returned directly when the observations leave a single candidate."
         ),
     )
